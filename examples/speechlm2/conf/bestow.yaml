@@ -1,0 +1,208 @@
+model:
+  # Pretrained model sources
+  pretrained_llm: TinyLlama/TinyLlama-1.1B-Chat-v1.0  # paper: TinyLlama-1.1B-chat
+  pretrained_asr: nvidia/canary-1b-flash                # paper: FastConformer from Canary-1B
+
+  pretrained_weights: true  # false = same architecture with random init
+
+  # Fine-tune from a previous training checkpoint (model weights only — optimizer,
+  # scheduler, and step counter start fresh). Supports DCP directories (from
+  # FSDP2/TP training), HuggingFace directories (model.safetensors), and
+  # single-file .ckpt checkpoints.  Set to null to train from scratch.
+  init_from_checkpoint: null
+
+  # BESTOW does NOT use an audio_locator_tag in the text sequence — audio is fused
+  # entirely via the cross-attention adapter.  No placeholder token is added to
+  # input_ids.  If migrating a SALM dataset that includes audio locator tags in the
+  # prompts, remove them from the prompt templates or use a prompt_format that omits them.
+
+  prompt_format: llama3  # adjust for your LLM (qwen, gemma, llama3, etc.)
+
+  # Optional: split audios longer than this duration before the speech encoder forward,
+  # then concatenate the encoded chunks before cross-attention. Null = no chunking.
+  encoder_chunk_size_seconds: null
+
+  # --------------------------------------------------------
+  # Parameter freezing
+  # --------------------------------------------------------
+  # By default: freeze LLM + speech encoder, train only modality adapter + BESTOW adapter.
+  # The cross-attention adapter (cross_attention_adapter.*) is always trainable.
+  freeze_params:
+    - "^llm\\..+$"
+    - "^embed_tokens\\..+$"
+    - "^perception\\.preprocessor\\..+$"
+    - "^perception\\.encoder\\..+$"
+  prevent_freeze_params: []
+
+  # LoRA on the LLM (optional — uncomment to enable via HuggingFace PEFT)
+  # lora:
+  #   task_type: CAUSAL_LM
+  #   r: 128
+  #   lora_alpha: 256
+  #   lora_dropout: 0.01
+  #   target_modules: ["q_proj", "v_proj"]
+
+  # --------------------------------------------------------
+  # Speech perception
+  # --------------------------------------------------------
+  # `output_dim` is automatically updated to match `pretrained_llm`'s hidden_size
+  # by setup_speech_encoder when pretrained_weights=true.  Set it explicitly here
+  # only when pretrained_weights=false (random init).
+  perception:
+    target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+    output_dim: 2048  # TinyLlama hidden_size; overwritten by setup_speech_encoder
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+      d_model: 1024   # FastConformer output dim
+
+    # Optional SpecAugment during training
+    # spec_augment:
+    #   _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    #   freq_masks: 2
+    #   time_masks: 10
+    #   freq_width: 27
+    #   time_width: 5
+
+  # --------------------------------------------------------
+  # BESTOW cross-attention adapter
+  # --------------------------------------------------------
+  # Sits between speech encoder outputs and the LLM.
+  # Each block: causal self-attn on text → cross-attn (text queries speech K/V) → FFN
+  # A global residual adds original text embeddings to the adapter output.
+  adapter:
+    num_layers: 2       # number of transformer blocks (2 per paper)
+    num_heads: 16       # must divide LLM hidden_size (2048 / 16 = 128 per head)
+    ffn_expansion: 4    # FFN hidden dim = hidden_size * ffn_expansion
+    dropout: 0.0
+
+  # --------------------------------------------------------
+  # Streaming (BESTOW-S) — set enabled: true to train a streaming model
+  # --------------------------------------------------------
+  # During streaming training, wait_k is sampled uniformly from [k_min, k_max]
+  # per batch, allowing a single checkpoint to serve multiple latency budgets.
+  # At inference, pass wait_k to model.generate() to select the desired latency.
+  #
+  # Wait-K policy: text position t may attend to speech frames 0..(wait_k + t)*stride - 1.
+  # Paper defaults: stride (L) = 4, k range [3, 12], default inference K = 10 (K = 6 for ASR).
+  streaming:
+    enabled: false   # set true for BESTOW-S
+    k_min: 3
+    k_max: 12
+    stride: 4        # speech encoder frames per text token (L in the paper)
+
+  # --------------------------------------------------------
+  # Optimizer & LR scheduler
+  # --------------------------------------------------------
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4        # paper: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3   # paper: 1e-3
+    foreach: true        # set false if tensor-parallelism causes issues
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 1000
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false            # logger provided by exp_manager
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 60000         # paper: 60k steps on 128 A100s
+  limit_train_batches: 5000
+  val_check_interval: ${trainer.limit_train_batches}
+  limit_val_batches: 10
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0   # paper: gradient clipping 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+    # Uncomment for model parallelism (FSDP2 + optional TP):
+    # _target_: lightning.pytorch.strategies.ModelParallelStrategy
+    # tensor_parallel_size: 1
+    # data_parallel_size: 8
+
+data:
+  train_ds:
+    sample_rate: 16000
+    prompt_format: ${model.prompt_format}
+    # token_equivalent_duration is used for bucketing: it converts audio duration
+    # to an equivalent token count to estimate total sequence length for bucketing.
+    # For Canary-1B FastConformer: 8x subsampling * 10ms hop = 80ms/frame.
+    # With Wait-K stride=4 in BESTOW-S, the effective token cost per audio frame
+    # from the LLM's perspective is lower, but the encoder frame rate is unchanged.
+    token_equivalent_duration: 0.08
+    input_cfg:
+      - type: lhotse_as_conversation
+        cuts_path: ???         # path to your Lhotse CutSet
+        # No audio_locator_tag here — BESTOW fuses audio via cross-attention,
+        # not via placeholder tokens in the text sequence.
+        tags:
+          # system_prompt: "You are a helpful speech assistant."  # for models that support system prompts
+          context: "Transcribe the speech."
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 4
+    batch_size: 4
+    # Optional dynamic bucketing (recommended for long audio):
+    # batch_size: null
+    # use_bucketing: true
+    # use_multimodal_sampling: true
+    # measure_total_length: true
+    # batch_tokens: 4000
+    # max_tokens: 2048
+    # bucket_duration_bins: [64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048]
+
+  validation_ds:
+    prompt_format: ${model.prompt_format}
+    token_equivalent_duration: 0.08
+    datasets:
+      val_set_0:
+        input_cfg:
+          - type: lhotse_as_conversation
+            cuts_path: ???
+            tags:
+              context: "Transcribe the speech."
+    sample_rate: 16000
+    batch_size: 1
+    seed: 42
+    shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: bestow_results/
+  name: bestow
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:50:00
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: bestow-run
+    project: bestow
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val_acc
+    mode: max
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 1
+    always_save_nemo: false
+    save_nemo_on_train_end: false

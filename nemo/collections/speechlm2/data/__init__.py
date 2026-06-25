@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .bestow_dataset import BESTOWDataset
 from .datamodule import DataModule
 from .duplex_ear_tts_dataset import DuplexEARTTSDataset
 from .duplex_stt_dataset import DuplexSTTDataset
@@ -18,6 +19,7 @@ from .s2s_dataset import DuplexS2SDataset
 from .salm_dataset import SALMDataset
 
 __all__ = [
+    'BESTOWDataset',
     'DataModule',
     'DuplexS2SDataset',
     'DuplexSTTDataset',

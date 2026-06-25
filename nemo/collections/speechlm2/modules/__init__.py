@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .bestow_adapter import BESTOWCrossAttentionAdapter
 from .perception import AudioPerceptionModule
 from .speech_generation import TransformerARSpeechDecoder
 
 __all__ = [
     'AudioPerceptionModule',
+    'BESTOWCrossAttentionAdapter',
     'TransformerARSpeechDecoder',
 ]

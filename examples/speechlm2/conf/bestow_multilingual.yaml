@@ -1,0 +1,275 @@
+model:
+  # --------------------------------------------------------
+  # Pretrained model sources
+  # --------------------------------------------------------
+  # For multilingual, prefer a multilingual LLM backbone and an ASR model
+  # trained on multiple languages (Canary-1B covers EN/DE/FR/ES).
+  pretrained_llm: Qwen/Qwen3-1.7B          # multilingual; covers 100+ languages
+  pretrained_asr: nvidia/canary-1b-flash    # EN/DE/FR/ES with FastConformer
+
+  pretrained_weights: true
+  init_from_checkpoint: null
+
+  prompt_format: qwen
+  encoder_chunk_size_seconds: null
+
+  # --------------------------------------------------------
+  # Parameter freezing
+  # --------------------------------------------------------
+  # MoE adapter + language embeddings are always trainable.
+  # Unfreeze the LLM (remove its freeze_params entry) if compute budget allows.
+  freeze_params:
+    - "^llm\\..+$"
+    - "^embed_tokens\\..+$"
+    - "^perception\\.preprocessor\\..+$"
+    - "^perception\\.encoder\\..+$"
+  prevent_freeze_params: []
+
+  # LoRA on LLM (useful when training multilingual with frozen LLM)
+  # lora:
+  #   task_type: CAUSAL_LM
+  #   r: 128
+  #   lora_alpha: 256
+  #   lora_dropout: 0.01
+  #   target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+  # --------------------------------------------------------
+  # Speech perception
+  # --------------------------------------------------------
+  perception:
+    target: nemo.collections.speechlm2.modules.perception.AudioPerceptionModule
+    output_dim: 2048   # auto-updated to LLM hidden_size by setup_speech_encoder
+    modality_adapter:
+      _target_: nemo.collections.speechlm2.modules.perception.IdentityConnector
+      d_model: 1024    # FastConformer output dim
+
+  # --------------------------------------------------------
+  # BESTOW cross-attention adapter — multilingual MoE variant
+  # --------------------------------------------------------
+  adapter:
+    num_layers: 2
+    num_heads: 16        # 2048 / 128 = 16 heads for Qwen3-1.7B
+    ffn_expansion: 4
+
+    # Sparse MoE FFN: each adapter block's FFN is replaced by N=8 expert FFNs.
+    # top_k=2 provides capacity similar to a 2× larger dense FFN while maintaining
+    # sparsity.  The router learns language-specific specialisation from data.
+    use_moe: true
+    num_experts: 8
+    top_k: 2
+    dropout: 0.0
+
+    # Load-balancing auxiliary loss weight.  Too small → expert collapse;
+    # too large → degrades CE training signal.  0.01 is a safe starting point.
+    moe_aux_loss_coeff: 0.01
+
+    # Language-ID conditioning: explicit language embedding added to speech
+    # features before cross-attention.  Set num_languages to the number of
+    # distinct language tags in your dataset (including an "unknown" bucket).
+    # Set to 0 to disable when language labels are unavailable.
+    #
+    # Supported languages and their recommended integer IDs should match the
+    # language_id mapping in your data pipeline.  Example mapping:
+    #   0=unknown, 1=en, 2=de, 3=fr, 4=es, 5=zh, 6=ja, 7=ko, 8=pt, 9=it, 10=ru
+    num_languages: 11    # 0 = unknown/fallback + 10 languages
+
+    # language_to_id: maps the string tag from "tags: language: ..." in the data
+    # config to the integer fed into the lang_embed lookup table.
+    # Must have exactly num_languages distinct values (including 0 = unknown).
+    language_to_id:
+      unknown: 0
+      en: 1
+      de: 2
+      fr: 3
+      es: 4
+      zh: 5
+      ja: 6
+      ko: 7
+      pt: 8
+      it: 9
+      ru: 10
+
+  # --------------------------------------------------------
+  # Streaming (optional)
+  # --------------------------------------------------------
+  streaming:
+    enabled: false
+    k_min: 3
+    k_max: 12
+    stride: 4
+
+  # --------------------------------------------------------
+  # Optimizer & LR scheduler
+  # --------------------------------------------------------
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    foreach: true
+
+  lr_scheduler:
+    _target_: nemo.core.optim.lr_scheduler.CosineAnnealing
+    warmup_steps: 2000       # longer warmup for multilingual stability
+    min_lr: 1e-6
+    max_steps: ${trainer.max_steps}
+
+trainer:
+  devices: -1
+  accelerator: gpu
+  num_nodes: 1
+  precision: bf16-true
+  logger: false
+  enable_checkpointing: false
+  use_distributed_sampler: false
+  max_steps: 100000          # multilingual converges slower; increase as needed
+  limit_train_batches: 5000
+  val_check_interval: ${trainer.limit_train_batches}
+  limit_val_batches: 20      # validate on more batches for stable multilingual metrics
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+    find_unused_parameters: true
+
+# --------------------------------------------------------
+# Data — multi-language dataset mixing via Lhotse
+# --------------------------------------------------------
+# Each entry under input_cfg is a separate Lhotse CutSet.
+# Lhotse's DynamicCutSampler mixes them at the specified weights.
+# Set cuts_path to your per-language datasets.
+data:
+  train_ds:
+    sample_rate: 16000
+    prompt_format: ${model.prompt_format}
+    token_equivalent_duration: 0.08
+    input_cfg:
+      # English
+      - type: lhotse_as_conversation
+        cuts_path: ???         # e.g. /data/en/train.jsonl.gz
+        weight: 1.0
+        tags:
+          context: "Transcribe the speech in English."
+          language: "en"
+
+      # German
+      - type: lhotse_as_conversation
+        cuts_path: ???         # e.g. /data/de/train.jsonl.gz
+        weight: 1.0
+        tags:
+          context: "Transcribe the speech in German."
+          language: "de"
+
+      # French
+      - type: lhotse_as_conversation
+        cuts_path: ???
+        weight: 1.0
+        tags:
+          context: "Transcribe the speech in French."
+          language: "fr"
+
+      # Spanish
+      - type: lhotse_as_conversation
+        cuts_path: ???
+        weight: 1.0
+        tags:
+          context: "Transcribe the speech in Spanish."
+          language: "es"
+
+    seed: 42
+    shuffle: true
+    shard_seed: "randomized"
+    num_workers: 4
+    # Dynamic bucketing recommended for multilingual (varied utterance lengths).
+    batch_size: null
+    use_bucketing: true
+    use_multimodal_sampling: true
+    measure_total_length: true
+    batch_tokens: 4000
+    max_tokens: 2048
+    bucket_duration_bins: [64, 128, 256, 384, 512, 768, 1024, 1280, 1536, 2048]
+
+  validation_ds:
+    prompt_format: ${model.prompt_format}
+    token_equivalent_duration: 0.08
+    datasets:
+      # One entry per language for per-language validation metrics.
+      val_en:
+        input_cfg:
+          - type: lhotse_as_conversation
+            cuts_path: ???
+            tags:
+              context: "Transcribe the speech in English."
+              language: "en"
+        sample_rate: 16000
+        batch_size: 1
+        seed: 42
+        shard_seed: "randomized"
+
+      val_de:
+        input_cfg:
+          - type: lhotse_as_conversation
+            cuts_path: ???
+            tags:
+              context: "Transcribe the speech in German."
+              language: "de"
+        sample_rate: 16000
+        batch_size: 1
+        seed: 42
+        shard_seed: "randomized"
+
+      val_fr:
+        input_cfg:
+          - type: lhotse_as_conversation
+            cuts_path: ???
+            tags:
+              context: "Transcribe the speech in French."
+              language: "fr"
+        sample_rate: 16000
+        batch_size: 1
+        seed: 42
+        shard_seed: "randomized"
+
+      val_es:
+        input_cfg:
+          - type: lhotse_as_conversation
+            cuts_path: ???
+            tags:
+              context: "Transcribe the speech in Spanish."
+              language: "es"
+        sample_rate: 16000
+        batch_size: 1
+        seed: 42
+        shard_seed: "randomized"
+
+exp_manager:
+  exp_dir: null
+  explicit_log_dir: bestow_multilingual_results/
+  name: bestow_multilingual
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  use_datetime_version: true
+  max_time_per_run: 00:03:50:00
+
+  resume_from_checkpoint: null
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: bestow-multilingual
+    project: bestow
+    resume: true
+
+  checkpoint_callback_params:
+    filename: "{step}"
+    monitor: val_loss
+    mode: min
+    every_n_train_steps: null
+    every_n_epochs: 1
+    save_top_k: 3
+    always_save_nemo: false
+    save_nemo_on_train_end: false

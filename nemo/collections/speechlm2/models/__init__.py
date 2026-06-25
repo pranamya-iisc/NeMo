@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .bestow import BESTOW
 from .duplex_ear_tts import DuplexEARTTS
 from .duplex_s2s_model import DuplexS2SModel
 from .duplex_s2s_speech_decoder_model import DuplexS2SSpeechDecoderModel
@@ -21,6 +22,7 @@ from .salm_asr_decoder import SALMWithAsrDecoder
 from .salm_automodel import SALMAutomodel
 
 __all__ = [
+    'BESTOW',
     'DuplexS2SModel',
     'DuplexS2SSpeechDecoderModel',
     'DuplexSTTModel',
