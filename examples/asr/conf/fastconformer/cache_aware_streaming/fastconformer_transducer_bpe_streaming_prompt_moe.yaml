@@ -193,9 +193,12 @@ model:
       top_k: 2
 
       # Language embedding for router conditioning.
-      # Set num_langs to match model.model_defaults.num_prompts (128).
-      # Set to 0 to disable language-conditioned routing.
-      num_langs: 128
+      # The paper (arxiv 2305.15663) uses NO explicit language conditioning —
+      # language specialization emerges implicitly.  Set num_langs: 0 (default)
+      # to match the paper.  Set num_langs to model.model_defaults.num_prompts
+      # (128) only to experiment with explicit language-conditioned routing
+      # (extension beyond the paper).
+      num_langs: 0
       lang_emb_dim: 64
 
       # Weight for the load-balancing auxiliary loss within the MoE module.
