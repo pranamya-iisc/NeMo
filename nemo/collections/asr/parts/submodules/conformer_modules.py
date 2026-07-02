@@ -13,6 +13,8 @@
 # limitations under the License.
 #
 
+from typing import Optional
+
 import torch
 from torch import nn as nn
 from torch.nn import LayerNorm
@@ -29,7 +31,7 @@ from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import activation_registry
 from nemo.core.classes.mixins import AccessMixin
 
-__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer']
+__all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerMoEFeedForward', 'ConformerLayer']
 
 
 class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
@@ -79,6 +81,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         use_bias=True,
         use_pytorch_sdpa=False,
         use_pytorch_sdpa_backends=None,
+        moe_config=None,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -90,9 +93,28 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         self.n_heads = n_heads
         self.fc_factor = 0.5
 
+        moe_enabled = moe_config is not None and moe_config.get('enabled', False)
+        apply_to_ff = moe_config.get('apply_to_ff', 'both') if moe_enabled else 'none'
+
+        def _make_ff(use_moe: bool):
+            if use_moe and moe_enabled:
+                return ConformerMoEFeedForward(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    use_bias=use_bias,
+                    num_experts=moe_config.get('num_experts', 4),
+                    top_k=moe_config.get('top_k', 2),
+                    variant=moe_config.get('variant', 'top_k'),
+                    num_langs=moe_config.get('num_langs', 0),
+                    lang_emb_dim=moe_config.get('lang_emb_dim', 64),
+                    aux_loss_coef=moe_config.get('aux_loss_coef', 1e-2),
+                )
+            return ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+
         # first feed forward module
         self.norm_feed_forward1 = LayerNorm(d_model)
-        self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+        self.feed_forward1 = _make_ff(apply_to_ff in ('both', 'ff1'))
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
@@ -152,12 +174,22 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
 
         # second feed forward module
         self.norm_feed_forward2 = LayerNorm(d_model)
-        self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias)
+        self.feed_forward2 = _make_ff(apply_to_ff in ('both', 'ff2'))
 
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
+        self.moe_aux_loss: Optional[torch.Tensor] = None
 
-    def forward(self, x, att_mask=None, pos_emb=None, pad_mask=None, cache_last_channel=None, cache_last_time=None):
+    def forward(
+        self,
+        x,
+        att_mask=None,
+        pos_emb=None,
+        pad_mask=None,
+        cache_last_channel=None,
+        cache_last_time=None,
+        lang_id: Optional[torch.Tensor] = None,
+    ):
         """
         Args:
             x (torch.Tensor): input signals (B, T, d_model)
@@ -166,14 +198,20 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             pad_mask (torch.tensor): padding mask
             cache_last_channel (torch.tensor) : cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : cache for convolutional layers (B, d_model, T_cache)
+            lang_id (torch.Tensor): (B,) integer language indices for MoE routing, or None
         Returns:
             x (torch.Tensor): (B, T, d_model)
             cache_last_channel (torch.tensor) : next cache for MHA layers (B, T_cache, d_model)
             cache_last_time (torch.tensor) : next cache for convolutional layers (B, d_model, T_cache)
         """
+        moe_loss = None
         residual = x
         x = self.norm_feed_forward1(x)
-        x = self.feed_forward1(x)
+        if isinstance(self.feed_forward1, ConformerMoEFeedForward):
+            x = self.feed_forward1(x, lang_id=lang_id)
+            moe_loss = self.feed_forward1.aux_loss
+        else:
+            x = self.feed_forward1(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
         x = self.norm_self_att(residual)
@@ -209,9 +247,15 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         residual = residual + self.dropout(x)
 
         x = self.norm_feed_forward2(residual)
-        x = self.feed_forward2(x)
+        if isinstance(self.feed_forward2, ConformerMoEFeedForward):
+            x = self.feed_forward2(x, lang_id=lang_id)
+            ff2_loss = self.feed_forward2.aux_loss
+            moe_loss = ff2_loss if moe_loss is None else moe_loss + ff2_loss
+        else:
+            x = self.feed_forward2(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
+        self.moe_aux_loss = moe_loss
         x = self.norm_out(residual)
 
         if self.is_adapter_available():
@@ -395,3 +439,103 @@ class ConformerFeedForward(nn.Module):
             if self.use_bias:
                 nn.init.uniform_(self.linear1.bias, -ffn1_max, ffn1_max)
                 nn.init.uniform_(self.linear2.bias, -ffn2_max, ffn2_max)
+
+
+class ConformerMoEFeedForward(nn.Module):
+    """Mixture-of-Experts drop-in replacement for ConformerFeedForward.
+
+    Routing variants:
+      - 'top_k': each token is dispatched to the top-K scoring experts.
+      - 'switch': each token is dispatched to the single top-1 expert (Switch Transformer).
+
+    When num_langs > 0, a per-language embedding is concatenated to the router input,
+    enabling language-conditioned routing for multilingual conformer models.
+    Reference: https://arxiv.org/abs/2305.15663
+
+    After each forward, self.aux_loss contains a load-balancing loss scalar that the
+    caller should add to the total training loss (weighted by moe_aux_loss_weight).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        dropout: float,
+        use_bias: bool = True,
+        num_experts: int = 4,
+        top_k: int = 2,
+        variant: str = 'top_k',
+        num_langs: int = 0,
+        lang_emb_dim: int = 64,
+        aux_loss_coef: float = 1e-2,
+    ):
+        super().__init__()
+        if variant not in ('top_k', 'switch'):
+            raise ValueError(f"MoE variant must be 'top_k' or 'switch', got '{variant}'")
+        self.num_experts = num_experts
+        self.effective_k = 1 if variant == 'switch' else top_k
+        self.variant = variant
+        self.aux_loss_coef = aux_loss_coef
+
+        router_in_dim = d_model + (lang_emb_dim if num_langs > 0 else 0)
+        self.router = nn.Linear(router_in_dim, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout, use_bias=use_bias) for _ in range(num_experts)]
+        )
+
+        self.lang_emb: Optional[nn.Embedding] = nn.Embedding(num_langs, lang_emb_dim) if num_langs > 0 else None
+        self.aux_loss: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor, lang_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, d_model)
+            lang_id: (B,) integer language indices for routing conditioning, or None
+        Returns:
+            output: (B, T, d_model)
+        Side-effect: self.aux_loss is set to the scalar load-balancing auxiliary loss.
+        """
+        B, T, D = x.shape
+        N = B * T
+
+        if self.lang_emb is not None and lang_id is not None:
+            lang_vec = self.lang_emb(lang_id).unsqueeze(1).expand(-1, T, -1)  # (B, T, emb_dim)
+            router_in = torch.cat([x, lang_vec], dim=-1).view(N, -1)
+        else:
+            router_in = x.view(N, D)
+
+        router_logits = self.router(router_in)  # (N, E)
+        router_probs = torch.softmax(router_logits, dim=-1)
+
+        top_gates, top_indices = torch.topk(router_probs, self.effective_k, dim=-1)  # (N, k)
+        top_gates = top_gates / top_gates.sum(dim=-1, keepdim=True)  # renormalize within top-k
+
+        # Load-balancing auxiliary loss: num_experts * sum(f_i * p_i)
+        # f_i: fraction of tokens dispatched to expert i (top-1 hard assignment)
+        # p_i: mean router probability for expert i
+        with torch.no_grad():
+            top1_hot = torch.zeros(N, self.num_experts, device=x.device)
+            top1_hot.scatter_(1, top_indices[:, 0:1], 1.0)
+            f = top1_hot.mean(0)
+        p = router_probs.mean(0)
+        self.aux_loss = self.aux_loss_coef * self.num_experts * (f * p).sum()
+
+        x_flat = x.view(N, D)
+        output = torch.zeros(N, D, dtype=x.dtype, device=x.device)
+
+        for e_idx in range(self.num_experts):
+            # Aggregate gate weights across top-k slots for expert e_idx
+            mask_e = (top_indices == e_idx)  # (N, k)
+            gate_e = (top_gates * mask_e.float()).sum(-1)  # (N,)
+            token_mask = gate_e > 0
+            if not token_mask.any():
+                continue
+            e_out = self.experts[e_idx](x_flat[token_mask])  # (n_e, D)
+            tok_idx = token_mask.nonzero(as_tuple=False).view(-1)  # (n_e,)
+            output.scatter_add_(
+                0,
+                tok_idx.unsqueeze(-1).expand(tok_idx.size(0), D),
+                gate_e[token_mask].unsqueeze(-1) * e_out,
+            )
+
+        return output.view(B, T, D)
