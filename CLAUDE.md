@@ -21,6 +21,8 @@ Dev quickstart: `uv sync --extra all --extra cu13` (Python 3.12+, PyTorch 2.7+; 
 - Fix: `isort <path> && black <path>` or `isort . && black .`
 - Jupyter Notebooks are excluded from automatic black reformatting (see `extend-exclude`), but can be still reformatted when passed directly. Do not reformat notebooks outside your changes.
 
+Pre-commit hooks (isort + black + YAML check + large-file guard) run automatically via pre-commit.ci on every PR. Install locally with `pre-commit install`; CI auto-commits formatting fixes back to the PR branch.
+
 ## Testing
 
 ```bash
@@ -88,6 +90,36 @@ Four frequently used data/training helpers:
 - **PyTorch Lightning** for training orchestration
 - **Lhotse** (>=1.32.2) for audio data loading
 - Collections are semi-isolated domains sharing `nemo.core` and `nemo.collections.common`
+
+### Model class hierarchy
+
+All ASR/TTS/Audio models follow this chain:
+
+```
+nemo.core.classes.ModelPT (LightningModule + save/restore + config)
+  └── ASRModel / SpectrogramGenerator / Vocoder / AudioToAudioModel
+        └── Concrete models (EncDecCTCModel, EncDecRNNTBPEModel, FastPitchModel, …)
+```
+
+`ModelPT` owns: OmegaConf config, `from_config_dict()` instantiation, `setup_{training,validation,test}_data()` dataloader hooks, and `SaveRestoreConnector`-based checkpoint logic.
+
+All module forward methods carry `@typecheck()` (from `nemo.core.classes.common`) to validate `NeuralType` tensor contracts at call boundaries — required on any new `NeuralModule` subclass.
+
+**SpeechLM2 is different**: models (`SALM`, `DuplexS2SModel`, `NemotronVoiceChat`, …) extend `LightningModule` + `HFHubMixin` directly — no `ModelPT`. They live in `nemo/collections/speechlm2/` and represent the LLM-decoder family.
+
+### Data pipeline
+
+Lhotse is the preferred loader for new code. The factory `get_lhotse_dataloader_from_config()` (`nemo/collections/common/data/lhotse/dataloader.py`) produces dataloaders from any config that points at manifests, tarred shards, or Parquet files via adapters (`LazyNeMoIterator`, `LazyParquetIterator` in `nemo_adapters.py`).
+
+```
+Manifest / Tarred / Parquet
+  → Lhotse adapters (nemo_adapters.py)
+  → CutSet  (temperature-reweighted multi-dataset sampling in cutset.py)
+  → LhotseSpeechToTextBpeDataset
+  → DataLoader  (collation: _speech_collate_fn for variable-length padding)
+```
+
+Legacy manifest-based datasets (`AudioToBPEDataset`, `_TarredAudioLabelDataset` in `nemo/collections/asr/data/audio_to_text.py`) remain for backwards compatibility.
 
 ## Subdirectory Instructions
 
