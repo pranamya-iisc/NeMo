@@ -732,8 +732,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 cache_last_time=cache_last_time_cur,
                 lang_id=lang_id,
             )
-            if layer.moe_aux_loss is not None:
-                moe_aux_loss_accum = layer.moe_aux_loss if moe_aux_loss_accum is None else moe_aux_loss_accum + layer.moe_aux_loss
+            layer_moe_loss = getattr(layer, 'moe_aux_loss', None)
+            if layer_moe_loss is not None:
+                moe_aux_loss_accum = layer_moe_loss if moe_aux_loss_accum is None else moe_aux_loss_accum + layer_moe_loss
 
             if cache_last_channel_cur is not None:
                 (audio_signal, cache_last_channel_cur, cache_last_time_cur) = audio_signal

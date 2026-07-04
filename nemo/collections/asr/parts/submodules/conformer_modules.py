@@ -208,7 +208,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         residual = x
         x = self.norm_feed_forward1(x)
         if isinstance(self.feed_forward1, ConformerMoEFeedForward):
-            x = self.feed_forward1(x, lang_id=lang_id)
+            x = self.feed_forward1(x, lang_id=lang_id, pad_mask=pad_mask)
             moe_loss = self.feed_forward1.aux_loss
         else:
             x = self.feed_forward1(x)
@@ -248,7 +248,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
 
         x = self.norm_feed_forward2(residual)
         if isinstance(self.feed_forward2, ConformerMoEFeedForward):
-            x = self.feed_forward2(x, lang_id=lang_id)
+            x = self.feed_forward2(x, lang_id=lang_id, pad_mask=pad_mask)
             ff2_loss = self.feed_forward2.aux_loss
             moe_loss = ff2_loss if moe_loss is None else moe_loss + ff2_loss
         else:
@@ -486,17 +486,28 @@ class ConformerMoEFeedForward(nn.Module):
         self.lang_emb: Optional[nn.Embedding] = nn.Embedding(num_langs, lang_emb_dim) if num_langs > 0 else None
         self.aux_loss: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor, lang_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        lang_id: Optional[torch.Tensor] = None,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T, d_model)
             lang_id: (B,) integer language indices for routing conditioning, or None
+            pad_mask: (B, T) bool mask from ConformerEncoder — True = padding frame, False = valid.
+                      Used to exclude padding tokens from load-balancing loss statistics only.
+                      Expert dispatch still processes all positions (consistent with non-MoE FF).
         Returns:
             output: (B, T, d_model)
         Side-effect: self.aux_loss is set to the scalar load-balancing auxiliary loss.
         """
         B, T, D = x.shape
         N = B * T
+
+        # valid_flat: (N,) True = valid token; None when no mask is available
+        valid_flat = (~pad_mask.view(N)) if pad_mask is not None else None
 
         if self.lang_emb is not None and lang_id is not None:
             lang_vec = self.lang_emb(lang_id).unsqueeze(1).expand(-1, T, -1)  # (B, T, emb_dim)
@@ -511,13 +522,14 @@ class ConformerMoEFeedForward(nn.Module):
         top_gates = top_gates / top_gates.sum(dim=-1, keepdim=True)  # renormalize within top-k
 
         # Load-balancing auxiliary loss: num_experts * sum(f_i * p_i)
-        # f_i: fraction of tokens dispatched to expert i (top-1 hard assignment)
-        # p_i: mean router probability for expert i
+        # f_i: fraction of valid tokens dispatched to expert i (top-1 hard assignment, no-grad)
+        # p_i: mean router probability for expert i over valid tokens (differentiable)
+        # Padding frames are excluded so batch imbalance doesn't bias the loss signal.
         with torch.no_grad():
-            top1_hot = torch.zeros(N, self.num_experts, device=x.device)
+            top1_hot = torch.zeros(N, self.num_experts, device=x.device, dtype=router_probs.dtype)
             top1_hot.scatter_(1, top_indices[:, 0:1], 1.0)
-            f = top1_hot.mean(0)
-        p = router_probs.mean(0)
+            f = top1_hot[valid_flat].mean(0) if valid_flat is not None else top1_hot.mean(0)
+        p = router_probs[valid_flat].mean(0) if valid_flat is not None else router_probs.mean(0)
         self.aux_loss = self.aux_loss_coef * self.num_experts * (f * p).sum()
 
         x_flat = x.view(N, D)
@@ -526,7 +538,7 @@ class ConformerMoEFeedForward(nn.Module):
         for e_idx in range(self.num_experts):
             # Aggregate gate weights across top-k slots for expert e_idx
             mask_e = (top_indices == e_idx)  # (N, k)
-            gate_e = (top_gates * mask_e.float()).sum(-1)  # (N,)
+            gate_e = (top_gates * mask_e.to(top_gates.dtype)).sum(-1)  # (N,)
             token_mask = gate_e > 0
             if not token_mask.any():
                 continue
