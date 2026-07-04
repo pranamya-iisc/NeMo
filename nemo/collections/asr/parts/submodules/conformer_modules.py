@@ -541,6 +541,11 @@ class ConformerMoEFeedForward(nn.Module):
             gate_e = (top_gates * mask_e.to(top_gates.dtype)).sum(-1)  # (N,)
             token_mask = gate_e > 0
             if not token_mask.any():
+                # No tokens dispatched to this expert in this batch. Run a
+                # zero-weighted forward pass so its parameters remain in the
+                # autograd graph (grad = 0-tensor, not None), preventing DDP
+                # "unused parameters" errors with find_unused_parameters=False.
+                self.aux_loss = self.aux_loss + self.experts[e_idx](x_flat[0:1]).sum() * 0.0
                 continue
             e_out = self.experts[e_idx](x_flat[token_mask])  # (n_e, D)
             tok_idx = token_mask.nonzero(as_tuple=False).view(-1)  # (n_e,)
