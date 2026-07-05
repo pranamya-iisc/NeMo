@@ -73,7 +73,9 @@ model:
     input_cfg:
       # ---- English (en-US) ------------------------------------------------
       - type: group
-        weight: 1.0          # updated at runtime by dynamic weighting
+        weight: 1.0          # updated at runtime by dynamic weighting; also the fallback
+                              # baseline for the first-ever reweighting update and, for the
+                              # filter strategy, the fixed source distribution
         tags:
           locale: en-US      # must match validation_ds name entry below
           prompt_mode: unified
@@ -224,12 +226,33 @@ model:
     # Floor weight; prevents any locale from being completely starved.
     min_weight: 0.01
 
-    # ---- Scaling direction -------------------------------------------------
-    # "wer"         (default): weight ∝ WER — upsamples poorly performing locales,
+    # Optional absolute ceiling on any locale's weight (safety valve against unbounded
+    # drift over very long training runs). null = unbounded.
+    max_weight: null
+
+    # ---- Scaling direction ---------------------------------------------------
+    # Weights are updated *relative to peer locales*, not from each locale's absolute
+    # WER value — see relative_stat/relative_sensitivity/max_update_ratio below.
+    # "wer"         (default): upsamples locales whose WER is worse than their peers,
     #               giving them more training data to converge faster.
-    # "inverse_wer": weight ∝ 1/WER — upsamples well-performing locales to
+    # "inverse_wer": upsamples locales whose WER is better than their peers, to
     #               maintain their quality while the rest catches up.
     scale: wer
+
+    # Reference statistic used to compare a locale's WER against its peers:
+    # "median" (default; robust to one locale being an outlier) or "mean".
+    relative_stat: median
+
+    # Exponent applied to (locale_wer / reference_wer). 1.0 (default) reacts
+    # proportionally to the relative gap; <1.0 dampens large gaps; >1.0 amplifies them.
+    relative_sensitivity: 1.0
+
+    # Per-update cap: a single reweighting cycle can change any locale's weight by at
+    # most this multiplicative factor (e.g. 1.5 == at most +50%/-33% per update).
+    # This is what keeps updates from being drastic — weights instead walk gradually
+    # toward the WER-implied target over several update cycles. The new weight is
+    # always `previous_weight * step_mult`, never recomputed from scratch.
+    max_update_ratio: 1.5
 
     # EMA coefficient for smoothing WER across epochs before computing weights.
     #   0.0  — no smoothing (react immediately to each epoch's WER)
@@ -237,9 +260,10 @@ model:
     #   0.7  — heavy smoothing (stable but slow to react)
     smoothing: 0.3
 
-    # Temperature passed to Lhotse's temperature_reweighting when the dataloader
-    # is rebuilt (rebuild strategy only).  1.0 preserves weight ratios exactly;
-    # <1.0 flattens them toward uniform; >1.0 amplifies differences.
+    # Lhotse's own static, config-time group-weight normalization (see
+    # nemo.collections.common.data.lhotse.cutset.temperature_reweighting /
+    # train_ds.reweight_temperature above). Independent of the relative-weighting
+    # math above; currently unused by the dynamic-weighting update rule itself.
     temperature: 1.0
 
     # Reweight after every N validation epochs (set >1 to reduce noise from

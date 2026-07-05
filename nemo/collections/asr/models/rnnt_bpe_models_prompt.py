@@ -15,6 +15,7 @@
 import json
 import os
 import random
+import statistics
 import tempfile
 from dataclasses import dataclass
 from math import ceil
@@ -114,6 +115,15 @@ class RNNTPromptTranscribeConfig(TranscribeConfig):
 class DynamicWeightingConfig:
     """Per-locale dynamic reweighting of Lhotse training shards based on validation WER.
 
+    Weights are updated *relative to peer locales*, not from each locale's absolute WER
+    value: every reweighting cycle, each locale's smoothed WER is compared against a
+    reference statistic (median or mean) across all currently-tracked locales, and the
+    resulting ratio (raised to ``relative_sensitivity``) is applied as a **multiplicative**
+    adjustment on top of the locale's *previous* weight — bounded by ``max_update_ratio`` so
+    a single cycle can never move a locale's weight drastically. This means a structurally
+    hard locale that is merely stable relative to its peers will not perpetually dominate
+    training the way weighting directly off absolute WER would.
+
     Two strategies are supported (select via ``strategy``):
 
     rebuild (default)
@@ -138,10 +148,29 @@ class DynamicWeightingConfig:
     strategy: str = "rebuild"
     locale_tag: str = "locale"
     min_weight: float = 0.01
+    # Optional absolute ceiling on any locale's weight. None = unbounded (min_weight remains
+    # the floor).
+    max_weight: Optional[float] = None
     smoothing: float = 0.0
-    # "wer"         → weight ∝ WER  (upsample poor locales; default, aids convergence)
-    # "inverse_wer" → weight ∝ 1/WER (upsample good locales; maintains diversity)
+    # "wer"         → upsamples locales whose WER is worse than their peers (default, aids
+    #                 convergence on lagging locales)
+    # "inverse_wer" → upsamples locales whose WER is better than their peers (maintains
+    #                 diversity / protects strong locales while the rest catch up)
     scale: str = "wer"
+    # Reference statistic used to compare a locale's WER against its peers: "median" (robust
+    # to a single outlier locale) or "mean".
+    relative_stat: str = "median"
+    # Exponent applied to (locale_wer / reference_wer). 1.0 reacts proportionally to the
+    # relative gap; <1.0 dampens large gaps; >1.0 amplifies them.
+    relative_sensitivity: float = 1.0
+    # Per-update cap on the multiplicative change to any locale's weight, e.g. 1.5 == at most
+    # +50%/-33% per reweighting cycle. This is what keeps updates from being "drastic";
+    # weights instead walk gradually toward the WER-implied target over several cycles.
+    max_update_ratio: float = 1.5
+    # NOTE: distinct from Lhotse's own static, config-time `train_ds.reweight_temperature`
+    # (see nemo.collections.common.data.lhotse.cutset.temperature_reweighting), which
+    # normalizes sibling group weights once when the CutSet pipeline is built. This field is
+    # currently unused by the dynamic-weighting update rule.
     temperature: float = 1.0
     update_interval_epochs: int = 1
     # filter strategy only: how often each worker re-reads the acceptance prob file.
@@ -211,6 +240,11 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
         self._dw_filter_state_file: Optional[str] = None
         # filter strategy: initial per-locale group weights (source distribution for rejection sampling)
         self._dw_source_weights: Dict[str, float] = {}
+        # Shared "previous weight" state consumed/produced by both strategies each cycle.
+        self._dw_current_weights: Dict[str, float] = {}
+        self._dw_current_weights_initialized: bool = False
+        # Original per-locale input_cfg weights — fallback base for a locale's first-ever update.
+        self._dw_initial_weights: Dict[str, float] = {}
 
     @classmethod
     def restore_from(
@@ -381,6 +415,14 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
         dw_cfg = self.cfg.get("dynamic_weighting", {})
+        if (
+            dw_cfg.get("enabled", False)
+            and not self._dw_current_weights_initialized
+            and train_data_config is not None
+            and train_data_config.get("input_cfg") is not None
+        ):
+            self._dw_init_current_weights(train_data_config, dw_cfg)
+
         if (
             dw_cfg.get("enabled", False)
             and dw_cfg.get("strategy", "rebuild") == "filter"
@@ -731,23 +773,95 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             else:
                 self._dw_smoothed_wer[locale] = wer
 
+        self._dw_current_weights = self._dw_compute_new_weights(
+            self._dw_smoothed_wer, self._dw_current_weights, self._dw_initial_weights, dw_cfg
+        )
+        logging.info(f"[DynamicWeighting] New locale weights: {self._dw_current_weights}")
+
         strategy = dw_cfg.get("strategy", "rebuild")
         if strategy == "filter":
             self._dw_write_filter_state(dw_cfg)
         else:
             self._dw_rebuild_with_new_weights(dw_cfg)
 
-    def _dw_raw_weight(self, wer: float, dw_cfg: dict) -> float:
-        """Translate a smoothed WER value into a raw shard weight."""
+    @staticmethod
+    def _dw_compute_new_weights(
+        smoothed_wer: Dict[str, float],
+        current_weights: Dict[str, float],
+        initial_weights: Dict[str, float],
+        dw_cfg: dict,
+    ) -> Dict[str, float]:
+        """Compute each locale's new weight from its WER *relative to its peers*.
+
+        The new weight is a multiplicative adjustment applied on top of the locale's previous
+        weight (``current_weights``, falling back to ``initial_weights`` on a locale's first
+        update): ``new = prev * clamp(ratio ** relative_sensitivity, 1/max_update_ratio,
+        max_update_ratio)``, where ``ratio`` compares the locale's smoothed WER to a reference
+        statistic (median/mean) across all currently-tracked locales. This keeps a single
+        cycle's change bounded (``max_update_ratio``) and makes the update depend on relative,
+        not absolute, WER — a locale that is stably as-hard-as-its-peers will not keep
+        accumulating weight just because its raw WER is high.
+        """
+        eps = 1e-6
         min_weight: float = dw_cfg.get("min_weight", 0.01)
+        max_weight: Optional[float] = dw_cfg.get("max_weight", None)
         scale: str = dw_cfg.get("scale", "wer")
-        if scale == "inverse_wer":
-            # 1/WER → upsamples the *best* locales (maintains diversity)
-            raw = 1.0 / max(wer, 1e-6)
+        relative_stat: str = dw_cfg.get("relative_stat", "median")
+        relative_sensitivity: float = dw_cfg.get("relative_sensitivity", 1.0)
+        max_update_ratio: float = max(dw_cfg.get("max_update_ratio", 1.5), 1.0 + eps)
+
+        new_weights: Dict[str, float] = dict(current_weights)
+
+        if len(smoothed_wer) < 2:
+            # No peer to compare against — seed any brand-new locale, otherwise no-op.
+            for locale in smoothed_wer:
+                new_weights.setdefault(locale, initial_weights.get(locale, 1.0))
+            return new_weights
+
+        wer_values = [max(w, eps) for w in smoothed_wer.values()]
+        if relative_stat == "mean":
+            reference = sum(wer_values) / len(wer_values)
         else:
-            # WER → upsamples the *worst* locales (default; faster convergence)
-            raw = wer
-        return max(raw, min_weight)
+            reference = statistics.median(wer_values)
+        reference = max(reference, eps)
+
+        for locale, wer in smoothed_wer.items():
+            ratio = max(wer, eps) / reference
+            if scale == "inverse_wer":
+                ratio = 1.0 / ratio
+            step_mult = ratio**relative_sensitivity
+            step_mult = min(max(step_mult, 1.0 / max_update_ratio), max_update_ratio)
+
+            prev = current_weights.get(locale, initial_weights.get(locale, 1.0))
+            w = prev * step_mult
+            w = max(w, min_weight)
+            if max_weight is not None:
+                w = min(w, max_weight)
+            new_weights[locale] = w
+
+        return new_weights
+
+    def _dw_init_current_weights(self, train_data_config: DictConfig, dw_cfg: dict) -> None:
+        """Seed the shared 'previous weight' state from the original per-locale input_cfg weights.
+
+        Runs once (for either strategy) the first time training data is set up while dynamic
+        weighting is enabled, so the very first reweighting cycle has a real previous weight
+        to multiplicatively adjust rather than assuming a uniform 1.0.
+        """
+        locale_tag: str = dw_cfg.get("locale_tag", "locale")
+
+        for entry in OmegaConf.to_container(train_data_config.input_cfg, resolve=True):
+            locale = (entry.get("tags") or {}).get(locale_tag)
+            if locale:
+                w = float(entry.get("weight", 1.0))
+                self._dw_initial_weights[locale] = w
+                self._dw_current_weights.setdefault(locale, w)
+
+        self._dw_current_weights_initialized = True
+
+        logging.info(
+            f"[DynamicWeighting] Initial locale weights: {self._dw_initial_weights}"
+        )
 
     def _dw_rebuild_with_new_weights(self, dw_cfg: dict) -> None:
         """Rebuild strategy: update input_cfg weights and recreate the DataLoader."""
@@ -762,9 +876,9 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
         updated: Dict[str, float] = {}
         for entry in raw_input_cfg:
             entry_locale = (entry.get("tags") or {}).get(locale_tag)
-            if not entry_locale or entry_locale not in self._dw_smoothed_wer:
+            if not entry_locale or entry_locale not in self._dw_current_weights:
                 continue
-            w = self._dw_raw_weight(self._dw_smoothed_wer[entry_locale], dw_cfg)
+            w = self._dw_current_weights[entry_locale]
             entry["weight"] = w
             updated[entry_locale] = w
 
@@ -789,11 +903,7 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
         if not self._dw_filter_state_file:
             return
 
-        locale_tag: str = dw_cfg.get("locale_tag", "locale")
-        target: Dict[str, float] = {
-            locale: self._dw_raw_weight(wer, dw_cfg)
-            for locale, wer in self._dw_smoothed_wer.items()
-        }
+        target: Dict[str, float] = self._dw_current_weights
 
         # Compute acceptance_i = (target_i / source_i) / max_j(target_j / source_j).
         # If source_i is unknown we treat it as uniform (1.0) — acceptable when all
