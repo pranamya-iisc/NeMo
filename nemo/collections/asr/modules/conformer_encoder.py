@@ -16,7 +16,7 @@ import math
 import random
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed
@@ -26,7 +26,7 @@ from torch import nn
 from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
-from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
+from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer, ConformerMoEFeedForward
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     LocalAttRelPositionalEncoding,
     MultiHeadAttention,
@@ -236,6 +236,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 "cache_last_time": NeuralType(('D', 'B', 'D', 'T'), ChannelType(), optional=True),
                 "cache_last_channel_len": NeuralType(tuple('B'), LengthsType(), optional=True),
                 "bypass_pre_encode": NeuralType(tuple(), BoolType(), optional=True),
+                "lang_id": NeuralType(tuple('B'), LengthsType(), optional=True),
             }
         )
 
@@ -335,6 +336,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         use_pytorch_sdpa: bool = False,
         use_pytorch_sdpa_backends=None,
         sync_max_audio_length: bool = True,
+        moe_config=None,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -472,8 +474,20 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
+        # Resolve which layers use MoE (the last num_moe_layers layers)
+        _moe_cfg = None
+        _num_moe_layers = 0
+        if moe_config is not None:
+            _moe_dict = dict(moe_config) if hasattr(moe_config, 'items') else {}
+            if _moe_dict.get('enabled', False):
+                _moe_cfg = _moe_dict
+                _num_moe_layers = int(_moe_dict.get('num_moe_layers', 0))
+        self._has_moe = _num_moe_layers > 0
+        self.moe_aux_loss: Optional[torch.Tensor] = None
+
         self.layers = nn.ModuleList()
         for i in range(n_layers):
+            layer_moe_cfg = _moe_cfg if (self._has_moe and i >= n_layers - _num_moe_layers) else None
             layer = ConformerLayer(
                 d_model=d_model,
                 d_ff=d_ff,
@@ -493,6 +507,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 use_bias=use_bias,
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
+                moe_config=layer_moe_cfg,
             )
             self.layers.append(layer)
 
@@ -579,6 +594,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         cache_last_time=None,
         cache_last_channel_len=None,
         bypass_pre_encode=False,
+        lang_id=None,
     ):
         """
         Forward function for the ConformerEncoder accepting an audio signal and its corresponding length.
@@ -588,6 +604,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
           containing audio features. Shape: ``(batch, feat_in, n_frames)``.
         - ``bypass_pre_encode=True``: ``audio_signal`` must be a tensor containing
           pre-encoded embeddings. Shape: ``(batch, n_frame, d_model)``.
+
+        lang_id: optional (B,) integer tensor of language indices used for MoE routing in
+          the last ``num_moe_layers`` conformer layers.  Ignored when MoE is disabled.
         """
         if not bypass_pre_encode and audio_signal.shape[-2] != self._feat_in:
             raise ValueError(
@@ -611,6 +630,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_time=cache_last_time,
             cache_last_channel_len=cache_last_channel_len,
             bypass_pre_encode=bypass_pre_encode,
+            lang_id=lang_id,
         )
 
     def forward_internal(
@@ -621,6 +641,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         cache_last_time=None,
         cache_last_channel_len=None,
         bypass_pre_encode=False,
+        lang_id=None,
     ):
         """
         The ``audio_signal`` input supports two formats depending on ``bypass_pre_encode``:
@@ -693,6 +714,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             cache_last_time_next = []
             cache_last_channel_next = []
 
+        moe_aux_loss_accum: Optional[torch.Tensor] = None
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = audio_signal
             if cache_last_channel is not None:
@@ -708,7 +730,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 pad_mask=pad_mask,
                 cache_last_channel=cache_last_channel_cur,
                 cache_last_time=cache_last_time_cur,
+                lang_id=lang_id,
             )
+            layer_moe_loss = getattr(layer, 'moe_aux_loss', None)
+            if layer_moe_loss is not None:
+                moe_aux_loss_accum = layer_moe_loss if moe_aux_loss_accum is None else moe_aux_loss_accum + layer_moe_loss
 
             if cache_last_channel_cur is not None:
                 (audio_signal, cache_last_channel_cur, cache_last_time_cur) = audio_signal
@@ -754,6 +780,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         name=f'interctc/layer_output_{lth}', tensor=torch.transpose(lth_audio_signal, 1, 2)
                     )
                     self.register_accessible_tensor(name=f'interctc/layer_length_{lth}', tensor=length)
+
+        self.moe_aux_loss = moe_aux_loss_accum
 
         if self.out_proj is not None:
             audio_signal = self.out_proj(audio_signal)

@@ -1,0 +1,292 @@
+# Cache-aware streaming FastConformer-Transducer (RNNT-only) with prompt conditioning
+# and Mixture-of-Experts (MoE) in the last K conformer FF layers.
+#
+# MoE variant is configured via model.encoder.moe_config.
+# Reference: https://arxiv.org/abs/2305.15663
+
+name: "FastConformer-Transducer-BPE-Prompt-MoE-Streaming"
+
+# Weight applied to the MoE load-balancing auxiliary loss added to the RNNT loss.
+# Set to 0.0 to disable without removing the MoE architecture.
+moe_aux_loss_weight: 0.01
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: false
+  log_prediction: true
+  skip_nan_grad: false
+
+  # Weight applied to MoE load-balancing auxiliary loss (exposed at model root for Hydra override)
+  moe_aux_loss_weight: ${moe_aux_loss_weight}
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+    initialize_prompt_feature: true
+    num_prompts: 128
+    norm: None
+    prompt_dictionary: {
+    'en-US': 0,
+    'en': 0,
+    'en-GB': 1,
+    'es-ES': 2,
+    'es': 3,
+    'zh-CN': 4,
+    'hi-IN': 6,
+    'ar-AR': 7,
+    'fr-FR': 8,
+    'fr': 8,
+    'de-DE': 9,
+    'de': 9,
+    'ja-JP': 10,
+    'ru-RU': 11,
+    'pt-BR': 12,
+    'ko-KR': 14,
+    'it-IT': 15,
+    'nl-NL': 16,
+    'pl-PL': 17,
+    'tr-TR': 18,
+    'uk-UA': 19,
+    'auto': 101
+    }
+
+  train_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    use_lhotse: true
+    batch_duration: 400
+    quadratic_duration: 15
+    num_buckets: 30
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    max_duration: 39.99
+    min_duration: 0.1
+    is_tarred: true
+    tarred_audio_filepaths: null
+    slice_length: 100
+    bucket_buffer_size: 10000
+    shuffle_buffer_size: 10000
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+    lang_field: target_lang
+    prompt_mode_field: prompt_mode
+    default_prompt_mode: unified
+    unified_auto_ratio: 0.5
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    batch_size: 2
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 2
+    pin_memory: true
+    batch_duration: null
+    use_lhotse: true
+    use_bucketing: false
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+    lang_field: target_lang
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 16
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 8
+    pin_memory: true
+    use_lhotse: true
+    use_bucketing: false
+    prompt_dictionary: ${model.model_defaults.prompt_dictionary}
+    num_prompts: ${model.model_defaults.num_prompts}
+    subsampling_factor: ${model.encoder.subsampling_factor}
+    lang_field: target_lang
+    default_prompt_mode: langID
+
+  tokenizer:
+    dir: ???
+    type: bpe
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "NA"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 128
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 10
+    freq_width: 27
+    time_width: 0.05
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 42
+    d_model: 1024
+    use_bias: false
+
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: true
+
+    reduction: null
+    reduction_position: null
+    reduction_factor: 1
+
+    ff_expansion_factor: 4
+
+    self_attention_model: rel_pos
+    n_heads: 8
+    att_context_size: [70, 6]
+    att_context_probs: null
+    att_context_style: chunked_limited
+    xscaling: false
+    untie_biases: true
+    pos_emb_max_len: 5000
+
+    conv_kernel_size: 9
+    conv_norm_type: 'layer_norm'
+    conv_context_size: causal
+
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+    # ── MoE configuration ────────────────────────────────────────────────────
+    # Replaces the ConformerFeedForward sub-modules in the last num_moe_layers
+    # conformer layers with Mixture-of-Experts modules.
+    moe_config:
+      enabled: true
+
+      # Number of tail layers (counting from the top) that use MoE FF.
+      # K=8 applies MoE to layers 34-41 of a 42-layer encoder.
+      num_moe_layers: 8
+
+      # Number of experts per MoE FF block.
+      num_experts: 8
+
+      # Routing variant: 'top_k' (top-K experts per token) or 'switch' (top-1).
+      variant: top_k
+
+      # K for top_k variant; ignored when variant='switch'.
+      top_k: 2
+
+      # Language embedding for router conditioning.
+      # The paper (arxiv 2305.15663) uses NO explicit language conditioning —
+      # language specialization emerges implicitly.  Set num_langs: 0 (default)
+      # to match the paper.  Set num_langs to model.model_defaults.num_prompts
+      # (128) only to experiment with explicit language-conditioned routing
+      # (extension beyond the paper).
+      num_langs: 0
+      lang_emb_dim: 64
+
+      # Weight for the load-balancing auxiliary loss within the MoE module.
+      # The result is further scaled by model.moe_aux_loss_weight before
+      # being added to the RNNT loss.
+      aux_loss_coef: 0.01
+
+      # Which FF sub-layers inside each conformer block get MoE:
+      # 'both' (default), 'ff1' (first half-step FF), 'ff2' (second half-step FF).
+      apply_to_ff: both
+
+  decoder:
+    _target_: nemo.collections.asr.modules.RNNTDecoder
+    normalization_mode: null
+    random_state_sampling: false
+    blank_as_pad: true
+
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 2
+      t_max: null
+      dropout: 0.2
+
+  joint:
+    _target_: nemo.collections.asr.modules.RNNTJoint
+    log_softmax: null
+    preserve_memory: false
+
+    fuse_loss_wer: true
+    fused_batch_size: 2
+
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.2
+
+  decoding:
+    strategy: "greedy_batch"
+    strip_lang_tags: true
+
+    greedy:
+      max_symbols: 10
+
+    beam:
+      beam_size: 2
+      return_best_hypothesis: False
+      score_norm: true
+      tsd_max_sym_exp: 50
+      alsd_max_target_len: 2.0
+
+  optim:
+    name: adamw
+    lr: 2e-4
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 5000
+      warmup_ratio: null
+      min_lr: 1e-5
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: -1
+  max_steps: 500000
+  val_check_interval: 5000
+  accelerator: gpu
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: bf16-mixed
+  enable_checkpointing: False
+  logger: false
+  log_every_n_steps: 100
+  check_val_every_n_epoch: null
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: false
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true

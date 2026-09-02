@@ -164,6 +164,16 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
 
+    def _add_moe_aux_loss(self, loss: torch.Tensor) -> torch.Tensor:
+        """Add weighted MoE load-balancing auxiliary loss if encoder has MoE layers."""
+        if not getattr(self.encoder, '_has_moe', False):
+            return loss
+        moe_aux = getattr(self.encoder, 'moe_aux_loss', None)
+        if moe_aux is None:
+            return loss
+        weight = self.cfg.get('moe_aux_loss_weight', 1.0)
+        return loss + weight * moe_aux
+
     # Data loading
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if config.get("use_lhotse"):
@@ -338,7 +348,10 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
         if self.spec_augmentation is not None and self.training:
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
-        encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+        enc_lang_id = prompt_indices if getattr(self.encoder, '_has_moe', False) else None
+        encoded, encoded_len = self.encoder(
+            audio_signal=processed_signal, length=processed_signal_length, lang_id=enc_lang_id
+        )
         encoded = torch.transpose(encoded, 1, 2)  # B x D x T -> B x T x D
 
         if self.concat:
@@ -387,6 +400,7 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
             loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
+            loss_value = self._add_moe_aux_loss(loss_value)
             loss_value = self.add_auxiliary_losses(loss_value)
 
             if AccessMixin.is_access_enabled(self.model_guid):
@@ -423,6 +437,7 @@ class EncDecRNNTBPEModelWithPrompt(PromptStreamingMixin, EncDecRNNTBPEModel, ASR
                 transcript_lengths=transcript_len,
                 compute_wer=compute_wer,
             )
+            loss_value = self._add_moe_aux_loss(loss_value)
             loss_value = self.add_auxiliary_losses(loss_value)
 
             if AccessMixin.is_access_enabled(self.model_guid):
